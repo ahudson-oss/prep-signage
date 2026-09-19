@@ -39,6 +39,15 @@
     padding: 6px 10px; border-radius: 4px;
     display: none; white-space: pre;
   }
+  /* Holds one hidden <img> per loaded slide. Keeping the element alive is what
+     keeps the decoded bitmap in memory, so a later network drop can't take
+     the slide away from us. */
+  #pool {
+    position: fixed; top: -10px; left: -10px;
+    width: 1px; height: 1px;
+    overflow: hidden; opacity: 0;
+    pointer-events: none;
+  }
 </style>
 </head>
 <body>
@@ -48,6 +57,7 @@
   <div class="layer" id="l1"><img alt=""></div>
 </div>
 <div id="dbg"></div>
+<div id="pool"></div>
 
 <script>
 /* ============================================================
@@ -58,7 +68,7 @@
 
 var CONFIG = {
   /* REQUIRED — the /exec URL from your Apps Script deployment */
-  endpoint: 'https://script.google.com/macros/s/AKfycbzLJS7rB3360btwvI1zFaGMrgvL0ce82rl-dxswMDM9DRwD0Iul6Xk1KExO26ptngmaZg/exec',
+  endpoint: 'PASTE_YOUR_APPS_SCRIPT_EXEC_URL_HERE',
 
   screen:        '',      /* optional named folder from SCREENS in Code.gs */
   folder:        '',      /* optional raw Drive folder ID override */
@@ -101,15 +111,16 @@ var CONFIG = {
 
   /* ------------------------------- state ---------------------------------- */
   var layers  = [document.getElementById('l0'), document.getElementById('l1')];
+  var pool    = document.getElementById('pool');
   var active  = 1;
   var slides  = [];
-  var cache   = {};          /* id -> { ok, src, obj } */
+  var cache   = {};          /* id -> { ok, src, el, fails, nextTry } */
   var cursor  = -1;
   var rev     = '';
   var online  = false;
   var boot    = new Date().getTime();
   var lastPoll = 'never';
-  var URLApi  = window.URL || window.webkitURL;
+  var priming = false;
 
   var i0 = layers[0].getElementsByTagName('img')[0];
   var i1 = layers[1].getElementsByTagName('img')[0];
@@ -162,12 +173,11 @@ var CONFIG = {
 
     /* release memory for slides that were removed from the folder */
     for (var id in cache) {
-      if (!keep[id] && cache[id] && cache[id].obj) {
-        try { URLApi.revokeObjectURL(cache[id].obj); } catch (e) {}
-        delete cache[id];
-      } else if (!keep[id]) {
-        delete cache[id];
+      if (keep[id]) continue;
+      if (cache[id] && cache[id].el && cache[id].el.parentNode) {
+        cache[id].el.parentNode.removeChild(cache[id].el);
       }
+      delete cache[id];
     }
 
     slides = incoming;
@@ -192,84 +202,82 @@ var CONFIG = {
     });
   }
 
-  /* ============================== PRELOADING ============================== */
+  /* ============================== PRELOADING ==============================
 
-  /* Preferred path: pull the bytes into memory as a blob, so a later network
-     drop or a 429 from Google cannot take the slide away from us.            */
+     Plain Image() loading only. Google's image CDN sends no CORS headers, so
+     XHR/fetch against it is blocked (and CORB-filtered) no matter what — it
+     can't be made to work. Instead, every successfully loaded <img> element is
+     parked in #pool and kept there. While the element lives, the browser holds
+     the decoded image, so the slide keeps rendering through a network drop, a
+     429, or a dead access point.
+     ====================================================================== */
+
   function preload(slide, done) {
     if (!slide) { done(false); return; }
-    if (cache[slide.id] && cache[slide.id].ok) { done(true); return; }
 
-    var xhr = null;
-    try { xhr = new XMLHttpRequest(); } catch (e) { xhr = null; }
+    var c = cache[slide.id];
+    if (c && c.ok) { done(true); return; }
 
-    if (xhr && ('responseType' in xhr)) {
-      try {
-        xhr.open('GET', slide.url, true);
-        xhr.responseType = 'blob';
-        xhr.timeout = 30000;
-        xhr.onload = function () {
-          if (xhr.status >= 200 && xhr.status < 300 && xhr.response && xhr.response.size > 0) {
-            var obj = null;
-            try { obj = URLApi.createObjectURL(xhr.response); } catch (e) { obj = null; }
-            if (obj) { decodeThen(slide, obj, done); return; }
-          }
-          plainPreload(slide, done);
-        };
-        xhr.onerror   = function () { plainPreload(slide, done); };
-        xhr.ontimeout = function () { plainPreload(slide, done); };
-        xhr.send();
-        return;
-      } catch (e) { /* fall through */ }
-    }
-    plainPreload(slide, done);
-  }
+    /* honour the back-off window so a bad file can't be hammered */
+    if (c && c.nextTry && new Date().getTime() < c.nextTry) { done(false); return; }
 
-  /* Make sure the blob actually decodes as an image before we trust it. */
-  function decodeThen(slide, obj, done) {
-    var im = new Image();
-    im.onload = function () {
-      cache[slide.id] = { ok: true, src: obj, obj: obj };
-      done(true);
-    };
-    im.onerror = function () {
-      try { URLApi.revokeObjectURL(obj); } catch (e) {}
-      plainPreload(slide, done);
-    };
-    im.src = obj;
-  }
-
-  /* Fallback: warm the browser's own HTTP cache with a hidden Image(). */
-  function plainPreload(slide, done) {
     var im = new Image();
     var settled = false;
+
     var t = setTimeout(function () {
-      if (!settled) { settled = true; done(false); }
+      if (settled) return;
+      settled = true;
+      im.onload = im.onerror = null;
+      markFailure(slide);
+      done(false);
     }, 30000);
 
     im.onload = function () {
       if (settled) return;
       settled = true; clearTimeout(t);
-      cache[slide.id] = { ok: true, src: slide.url, obj: null };
+      pool.appendChild(im);                 /* keep the bitmap resident */
+      cache[slide.id] = { ok: true, src: slide.url, el: im, fails: 0 };
       done(true);
     };
+
     im.onerror = function () {
       if (settled) return;
       settled = true; clearTimeout(t);
+      markFailure(slide);
       done(false);
     };
+
     im.src = slide.url;
   }
 
-  /* Fetch the next not-yet-cached slide, one at a time, gently. */
+  /* Exponential back-off: 10s, 20s, 40s ... capped at 5 minutes. */
+  function markFailure(slide) {
+    var c = cache[slide.id] || { ok: false, fails: 0 };
+    c.ok = false;
+    c.fails = (c.fails || 0) + 1;
+    var wait = 5000 * Math.pow(2, Math.min(c.fails, 6));
+    c.nextTry = new Date().getTime() + Math.min(wait, 300000);
+    cache[slide.id] = c;
+  }
+
+  /* Fetch the next eligible slide, one at a time. Slides inside their back-off
+     window are skipped, not retried — that was the runaway loop. */
   function primeNext() {
-    if (!slides.length) return;
+    if (priming || !slides.length) return;
+    var now = new Date().getTime();
+
     for (var i = 1; i <= slides.length; i++) {
       var s = slides[(cursor + i + slides.length) % slides.length];
-      if (!cache[s.id] || !cache[s.id].ok) {
-        preload(s, function () { setTimeout(primeNext, 400); });
-        return;
-      }
+      var c = cache[s.id];
+      if (c && c.ok) continue;
+      if (c && c.nextTry && now < c.nextTry) continue;
+
+      priming = true;
+      preload(s, function () {
+        priming = false;
+        setTimeout(primeNext, 600);
+      });
+      return;
     }
   }
 
@@ -356,11 +364,15 @@ var CONFIG = {
 
   function paintDebug() {
     if (!DEBUG) return;
-    var cached = 0;
-    for (var k in cache) if (cache[k] && cache[k].ok) cached++;
+    var cached = 0, waiting = 0;
+    for (var k in cache) {
+      if (cache[k] && cache[k].ok) cached++;
+      else if (cache[k]) waiting++;
+    }
     var cur = (cursor >= 0 && slides[cursor]) ? slides[cursor].name : '—';
     document.getElementById('dbg').innerHTML =
-      'slides ' + slides.length + '   cached ' + cached + '   net ' + (online ? 'up' : 'down') +
+      'slides ' + slides.length + '   cached ' + cached + '   failed ' + waiting +
+      '   net ' + (online ? 'up' : 'down') +
       '\nnow    ' + cur +
       '\npoll   ' + lastPoll +
       '\nup     ' + (((new Date().getTime() - boot) / 3600000).toFixed(2)) + 'h  rev ' + rev;
