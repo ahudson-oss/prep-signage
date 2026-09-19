@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow,noarchive">
+<title>Signage</title>
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    width: 100%; height: 100%;
+    background: #000;
+    overflow: hidden;
+    cursor: none;
+  }
+  #stage {
+    position: fixed; top: 0; left: 0;
+    width: 100vw; height: 100vh;
+    background: #000;
+  }
+  .layer {
+    position: absolute; top: 0; left: 0;
+    width: 100%; height: 100%;
+    opacity: 0;
+    -webkit-transition: opacity 900ms ease-in-out;
+    transition: opacity 900ms ease-in-out;
+  }
+  .layer.on { opacity: 1; }
+  .layer img {
+    display: block;
+    width: 100%; height: 100%;
+    -o-object-fit: contain;
+    object-fit: contain;
+  }
+  #dbg {
+    position: fixed; left: 12px; bottom: 10px;
+    font: 13px/1.5 monospace;
+    color: #6f6; background: rgba(0,0,0,.7);
+    padding: 6px 10px; border-radius: 4px;
+    display: none; white-space: pre;
+  }
+  /* Holds one hidden <img> per loaded slide. Keeping the element alive is what
+     keeps the decoded bitmap in memory, so a later network drop can't take
+     the slide away from us. */
+  #pool {
+    position: fixed; top: -10px; left: -10px;
+    width: 1px; height: 1px;
+    overflow: hidden; opacity: 0;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <div class="layer" id="l0"><img alt=""></div>
+  <div class="layer" id="l1"><img alt=""></div>
+</div>
+<div id="dbg"></div>
+<div id="pool"></div>
+
+<script>
+/* ============================================================
+   DES MOINES PREP — SIGNAGE PLAYER
+   Self-contained. Host on GitHub Pages. No dependencies.
+   Written in ES5 so it runs on Tizen 2.4 (SSSP4) through Tizen 8.
+   ============================================================ */
+
+var CONFIG = {
+  /* REQUIRED — the /exec URL from your Apps Script deployment */
+  endpoint: 'https://script.google.com/macros/s/AKfycbzt0-jqUGrbvArh6ZBcVesn3lw3tcSP2p7iQo9lGkzXMGv4A2i_YaEaxY_O_FUzUJtsHg/exec',
+
+  screen:        '',      /* optional named folder from SCREENS in Code.gs */
+  folder:        '',      /* optional raw Drive folder ID override */
+  slideSeconds:  12,      /* how long each slide is held */
+  fadeMs:        900,     /* cross-fade duration */
+  pollSeconds:   300,     /* how often to check Drive for changes (5 min) */
+  fit:           'contain',
+  reloadHour:    3,       /* nightly clean reload, 24h clock */
+  maxUptimeHours: 20,     /* failsafe reload if the nightly one is missed */
+  retrySeconds:  20       /* retry interval when nothing is playable yet */
+};
+
+/* Anything above can be overridden per TV via query string, e.g.
+   index.html?screen=gym&slide=15&fit=cover&debug=1                     */
+
+(function () {
+  'use strict';
+
+  /* ---------- swallow every runtime error; never blank the screen ---------- */
+  window.onerror = function () { return true; };
+
+  /* ------------------------------ query string ---------------------------- */
+  var Q = {};
+  (function () {
+    var s = location.search.replace(/^\?/, '');
+    if (!s) return;
+    var parts = s.split('&');
+    for (var i = 0; i < parts.length; i++) {
+      var kv = parts[i].split('=');
+      Q[decodeURIComponent(kv[0])] = decodeURIComponent((kv[1] || '').replace(/\+/g, ' '));
+    }
+  })();
+
+  if (Q.screen) CONFIG.screen = Q.screen;
+  if (Q.folder) CONFIG.folder = Q.folder;
+  if (Q.slide)  CONFIG.slideSeconds = parseInt(Q.slide, 10) || CONFIG.slideSeconds;
+  if (Q.poll)   CONFIG.pollSeconds = parseInt(Q.poll, 10) || CONFIG.pollSeconds;
+  if (Q.fit)    CONFIG.fit = Q.fit;
+  var DEBUG = (Q.debug === '1');
+
+  /* ------------------------------- state ---------------------------------- */
+  var layers  = [document.getElementById('l0'), document.getElementById('l1')];
+  var pool    = document.getElementById('pool');
+  var active  = 1;
+  var slides  = [];
+  var cache   = {};          /* id -> { ok, src, el, fails, nextTry } */
+  var cursor  = -1;
+  var rev     = '';
+  var online  = false;
+  var boot    = new Date().getTime();
+  var lastPoll = 'never';
+  var priming = false;
+
+  var i0 = layers[0].getElementsByTagName('img')[0];
+  var i1 = layers[1].getElementsByTagName('img')[0];
+  i0.style.objectFit = i1.style.objectFit = CONFIG.fit;
+  layers[0].style.transitionDuration = layers[1].style.transitionDuration = CONFIG.fadeMs + 'ms';
+  layers[0].style.WebkitTransitionDuration = layers[1].style.WebkitTransitionDuration = CONFIG.fadeMs + 'ms';
+
+  if (DEBUG) document.getElementById('dbg').style.display = 'block';
+
+  /* ======================= MANIFEST (JSONP transport) ====================== */
+
+  var seq = 0;
+
+  function fetchManifest(done) {
+    if (!CONFIG.endpoint || CONFIG.endpoint.indexOf('PASTE_') === 0) { done(null); return; }
+
+    var name = '__sig' + (++seq) + '_' + (new Date().getTime() % 100000);
+    var url  = CONFIG.endpoint
+             + (CONFIG.endpoint.indexOf('?') > -1 ? '&' : '?')
+             + 'callback=' + name
+             + '&t=' + new Date().getTime()
+             + (CONFIG.folder ? '&folder=' + encodeURIComponent(CONFIG.folder) : '')
+             + (CONFIG.screen ? '&screen=' + encodeURIComponent(CONFIG.screen) : '');
+
+    var el = document.createElement('script');
+    var finished = false;
+
+    function finish(data) {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      try { delete window[name]; } catch (e) { window[name] = undefined; }
+      if (el.parentNode) el.parentNode.removeChild(el);
+      done(data);
+    }
+
+    var timer = setTimeout(function () { finish(null); }, 25000);
+    window[name] = function (d) { finish(d); };
+    el.onerror = function () { finish(null); };
+    el.src = url;
+    document.getElementsByTagName('head')[0].appendChild(el);
+  }
+
+  function applyManifest(data) {
+    var incoming = data.slides || [];
+    var keep = {};
+    var i;
+
+    for (i = 0; i < incoming.length; i++) keep[incoming[i].id] = true;
+
+    /* release memory for slides that were removed from the folder */
+    for (var id in cache) {
+      if (keep[id]) continue;
+      if (cache[id] && cache[id].el && cache[id].el.parentNode) {
+        cache[id].el.parentNode.removeChild(cache[id].el);
+      }
+      delete cache[id];
+    }
+
+    slides = incoming;
+    rev = data.rev || '';
+    primeNext();
+  }
+
+  function poll() {
+    fetchManifest(function (data) {
+      if (data && !data.error && data.slides) {
+        online = true;
+        lastPoll = stamp() + ' ok(' + data.count + ')';
+        /* An empty folder does NOT blank the screen — the last slide holds. */
+        if (data.rev !== rev && data.count > 0) applyManifest(data);
+        else if (data.count === 0) lastPoll = stamp() + ' ok(empty, holding)';
+      } else {
+        online = false;
+        lastPoll = stamp() + ' fail';
+      }
+      paintDebug();
+      setTimeout(poll, CONFIG.pollSeconds * 1000);
+    });
+  }
+
+  /* ============================== PRELOADING ==============================
+
+     Plain Image() loading only. Google's image CDN sends no CORS headers, so
+     XHR/fetch against it is blocked (and CORB-filtered) no matter what — it
+     can't be made to work. Instead, every successfully loaded <img> element is
+     parked in #pool and kept there. While the element lives, the browser holds
+     the decoded image, so the slide keeps rendering through a network drop, a
+     429, or a dead access point.
+     ====================================================================== */
+
+  function preload(slide, done) {
+    if (!slide) { done(false); return; }
+
+    var c = cache[slide.id];
+    if (c && c.ok) { done(true); return; }
+
+    /* honour the back-off window so a bad file can't be hammered */
+    if (c && c.nextTry && new Date().getTime() < c.nextTry) { done(false); return; }
+
+    var im = new Image();
+    var settled = false;
+
+    var t = setTimeout(function () {
+      if (settled) return;
+      settled = true;
+      im.onload = im.onerror = null;
+      markFailure(slide);
+      done(false);
+    }, 30000);
+
+    im.onload = function () {
+      if (settled) return;
+      settled = true; clearTimeout(t);
+      pool.appendChild(im);                 /* keep the bitmap resident */
+      cache[slide.id] = { ok: true, src: slide.url, el: im, fails: 0 };
+      done(true);
+    };
+
+    im.onerror = function () {
+      if (settled) return;
+      settled = true; clearTimeout(t);
+      markFailure(slide);
+      done(false);
+    };
+
+    im.src = slide.url;
+  }
+
+  /* Exponential back-off: 10s, 20s, 40s ... capped at 5 minutes. */
+  function markFailure(slide) {
+    var c = cache[slide.id] || { ok: false, fails: 0 };
+    c.ok = false;
+    c.fails = (c.fails || 0) + 1;
+    var wait = 5000 * Math.pow(2, Math.min(c.fails, 6));
+    c.nextTry = new Date().getTime() + Math.min(wait, 300000);
+    cache[slide.id] = c;
+  }
+
+  /* Fetch the next eligible slide, one at a time. Slides inside their back-off
+     window are skipped, not retried — that was the runaway loop. */
+  function primeNext() {
+    if (priming || !slides.length) return;
+    var now = new Date().getTime();
+
+    for (var i = 1; i <= slides.length; i++) {
+      var s = slides[(cursor + i + slides.length) % slides.length];
+      var c = cache[s.id];
+      if (c && c.ok) continue;
+      if (c && c.nextTry && now < c.nextTry) continue;
+
+      priming = true;
+      preload(s, function () {
+        priming = false;
+        setTimeout(primeNext, 600);
+      });
+      return;
+    }
+  }
+
+  /* =============================== PLAYBACK =============================== */
+
+  function nextPlayable() {
+    if (!slides.length) return null;
+    for (var i = 0; i < slides.length; i++) {
+      cursor = (cursor + 1) % slides.length;
+      var s = slides[cursor];
+      if (cache[s.id] && cache[s.id].ok) return s;
+    }
+    return null;
+  }
+
+  function show(slide) {
+    var incoming = layers[1 - active];
+    var img = incoming.getElementsByTagName('img')[0];
+    img.src = cache[slide.id].src;
+
+    /* two frames so the browser has the pixels ready before the fade starts */
+    raf(function () {
+      raf(function () {
+        incoming.className = 'layer on';
+        layers[active].className = 'layer';
+        active = 1 - active;
+      });
+    });
+  }
+
+  function tick() {
+    var slide = nextPlayable();
+
+    if (!slide) {
+      /* Nothing cached yet — hold whatever is on screen, keep trying.
+         Cold start with no network lands here, so re-ask for the playlist
+         quickly rather than waiting out the normal poll interval.          */
+      if (!slides.length) {
+        fetchManifest(function (data) {
+          if (data && !data.error && data.count > 0) {
+            online = true;
+            lastPoll = stamp() + ' ok(' + data.count + ')';
+            applyManifest(data);
+          } else {
+            online = false;
+            lastPoll = stamp() + ' fail';
+          }
+        });
+      } else {
+        primeNext();
+      }
+      paintDebug();
+      setTimeout(tick, CONFIG.retrySeconds * 1000);
+      return;
+    }
+
+    show(slide);
+    primeNext();
+    paintDebug();
+    setTimeout(tick, CONFIG.slideSeconds * 1000);
+  }
+
+  /* ============================== WATCHDOG ================================ */
+
+  /* Clean reload nightly to clear memory. Skipped when offline, because a
+     reload with no network would drop every cached image and go black.       */
+  setInterval(function () {
+    var now = new Date();
+    var upHours = (new Date().getTime() - boot) / 3600000;
+    var atWindow = (now.getHours() === CONFIG.reloadHour && now.getMinutes() < 3);
+    var overdue  = (upHours > CONFIG.maxUptimeHours);
+    if ((atWindow || overdue) && online && upHours > 1) {
+      location.reload(true);
+    }
+  }, 60000);
+
+  /* ================================ DEBUG ================================= */
+
+  function stamp() {
+    var d = new Date();
+    return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  }
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+
+  function paintDebug() {
+    if (!DEBUG) return;
+    var cached = 0, waiting = 0;
+    for (var k in cache) {
+      if (cache[k] && cache[k].ok) cached++;
+      else if (cache[k]) waiting++;
+    }
+    var cur = (cursor >= 0 && slides[cursor]) ? slides[cursor].name : '—';
+    document.getElementById('dbg').innerHTML =
+      'slides ' + slides.length + '   cached ' + cached + '   failed ' + waiting +
+      '   net ' + (online ? 'up' : 'down') +
+      '\nnow    ' + cur +
+      '\npoll   ' + lastPoll +
+      '\nup     ' + (((new Date().getTime() - boot) / 3600000).toFixed(2)) + 'h  rev ' + rev;
+  }
+
+  function raf(fn) {
+    if (window.requestAnimationFrame) window.requestAnimationFrame(fn);
+    else setTimeout(fn, 16);
+  }
+
+  /* ================================ START ================================= */
+
+  fetchManifest(function (data) {
+    if (data && !data.error && data.slides && data.count > 0) {
+      online = true;
+      lastPoll = stamp() + ' ok(' + data.count + ')';
+      applyManifest(data);
+    } else {
+      online = false;
+      lastPoll = stamp() + ' fail';
+    }
+    paintDebug();
+    tick();
+    setTimeout(poll, CONFIG.pollSeconds * 1000);
+  });
+
+})();
+</script>
+</body>
+</html>
